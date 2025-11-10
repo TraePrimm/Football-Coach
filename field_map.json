@@ -1,0 +1,56 @@
+{
+  "map_dimensions_pixels": {
+    "width": 1600,
+    "height": 3000
+  },
+  "map_dimensions_feet": {
+    "width": 160,
+    "height": 300
+  },
+  "pixels_per_foot": 10,
+  "hash_x_coordinates": {
+    "left_hash_x": 708,
+    "right_hash_x": 892
+  },
+  "yard_line_y_coordinates": {
+    "0": 0,
+    "5": 150,
+    "10": 300,
+    "15": 450,
+    "20": 600,
+    "25": 750,
+    "30": 900,
+    "35": 1050,
+    "40": 1200,
+    "45": 1350,
+    "50": 1500,
+    "Other_45": 1650,
+    "Other_40": 1800,
+    "Other_35": 1950,
+    "Other_30": 2100,
+    "Other_25": 2250,
+    "Other_20": 2400,
+    "Other_15": 2550,
+    "Other_10": 2700,
+    "Other_5": 2850,
+    "Other_0": 3000
+  },
+  "hash_points_for_manual_click": {
+    "25_Yd_right_Hash": [892, 750],
+    "30_Yd_Left_Hash": [708, 900],
+    "30_Yd_Right_Hash": [892, 900],
+    "35_Yd_Left_Hash": [708, 1050],
+    "35_Yd_Right_Hash": [892, 1050],
+    "40_Yd_Left_Hash": [708, 1200],
+    "40_Yd_Right_Hash": [892, 1200],
+    "45_Yd_Left_Hash": [708, 1350],
+    "45_Yd_Right_Hash": [892, 1350],
+    "45_Yd_Right_Sideline": [1600, 1350],
+    "50_Yd_Left_Hash": [708, 1500],
+    "50_Yd_Right_Hash": [892, 1500],
+    "50_Yd_Right_Sideline": [1600, 1500],
+    "Other_45_Yd_Left_Hash": [708, 1650],
+    "Other_45_Yd_Right_Hash": [892, 1650],
+    "Other_45_Yd_Right_Sideline": [1600, 1650]
+  }
+}
