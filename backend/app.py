@@ -62,6 +62,11 @@ yolo_device = "cpu"
 
 home_hsv_center = None
 away_hsv_center = None
+player_team_votes   = {}   # {play_id: {track_id: {"home":0, "away":0, "locked":False}}}
+player_hsv_ema      = {}   # {play_id: {track_id: np.array([H,S,V])}}
+VOTE_THRESHOLD      = 0.70 # 70 % of frames must agree
+EMA_ALPHA           = 0.25 # how fast a player's own color adapts
+MAX_JUMP_PX         = 80   # ignore frames with huge position jumps
 
 processed_plays = {}        # {play_id: {frames, total_frames, fps, duration}}
 current_play_cache = {}     # {play_id: {progress, message}}
@@ -177,6 +182,120 @@ def run_yolo_detector(frame: np.ndarray) -> dict:
         "ref_boxes": ref_boxes
     }
 
+def get_brightness(frame: np.ndarray, box) -> float:
+    """Calculate average V (brightness) from HSV, ignoring green field and small bright spots."""
+    x1, y1, x2, y2 = [int(p) for p in box]
+    h, w = y2 - y1, x2 - x1
+    if h < 10 or w < 10:
+        return 0.0
+
+    crop = frame[
+        int(y1 + 0.25 * h): int(y2 - 0.25 * h),
+        int(x1 + 0.25 * w): int(x2 - 0.25 * w)
+    ]
+    if crop.size == 0:
+        return 0.0
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
+    non_green = hsv[cv2.bitwise_not(green_mask) > 0]
+    
+    if len(non_green) > 0:
+        # Get the V (brightness) values
+        v_values = non_green[:, 2]
+
+        v_median = np.median(v_values)
+        v_std = np.std(v_values)
+        
+        filtered_v = v_values[np.abs(v_values - v_median) <= 1.5 * v_std]
+        
+        if len(filtered_v) > 0:
+            return float(np.mean(filtered_v))
+        return float(np.mean(v_values))
+    return 0.0
+
+# --------------------------------------------------------------
+# 1. NEW HELPERS (replace the old get_average_hsv / classify_player_team)
+# --------------------------------------------------------------
+def get_jersey_hsv(frame: np.ndarray, box) -> np.ndarray:
+    """
+    Return mean HSV of the *upper* 45 % of the player box (jersey area).
+    Green field and the lower ~30 % (pants) are masked out.
+    """
+    x1, y1, x2, y2 = map(int, box)
+    h, w = y2 - y1, x2 - x1
+    if h < 20 or w < 20:
+        return np.array([0, 0, 0])
+
+    # ---- crop to upper jersey (top 45% of the box) ----
+    jersey_top    = int(y1 + 0.05 * h)          # avoid helmet
+    jersey_bottom = int(y1 + 0.50 * h)          # stop before pants
+    crop = frame[jersey_top:jersey_bottom, x1:x2]
+
+    if crop.size == 0:
+        return np.array([0, 0, 0])
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+    # ---- mask green field (very tolerant) ----
+    green_lo = np.array([30, 30, 30])
+    green_hi = np.array([90, 255, 255])
+    green_mask = cv2.inRange(hsv, green_lo, green_hi)
+
+    # ---- mask pants (bottom 30% of *original* box) ----
+    pants_top = int(y2 - 0.30 * h)
+    pants_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    pants_mask[pants_top - y1: , :] = 255          # relative to crop start
+
+    # combine masks
+    field_or_pants = cv2.bitwise_or(green_mask, pants_mask)
+    jersey_pixels = hsv[cv2.bitwise_not(field_or_pants) > 0]
+
+    if len(jersey_pixels) == 0:
+        return np.array([0, 0, 0])
+    return np.mean(jersey_pixels, axis=0)
+
+
+def update_team_centers(home_center, away_center, hsv_samples_home, hsv_samples_away, alpha=0.3):
+    """EMA update of the two team HSV centers."""
+    if hsv_samples_home:
+        new_home = np.mean(hsv_samples_home, axis=0)
+        home_center = new_home if home_center is None else (1-alpha)*home_center + alpha*new_home
+    if hsv_samples_away:
+        new_away = np.mean(hsv_samples_away, axis=0)
+        away_center = new_away if away_center is None else (1-alpha)*away_center + alpha*new_away
+    return home_center, away_center
+
+
+def init_play_state(play_id):
+    """Called once at the start of process_video."""
+    player_team_votes[play_id] = {}
+    player_hsv_ema[play_id]    = {}
+
+def cleanup_play_state(play_id):
+    player_team_votes.pop(play_id, None)
+    player_hsv_ema.pop(play_id, None)
+
+def update_player_ema(play_id, track_id, hsv):
+    """Running EMA of the *jersey* HSV for this player."""
+    ema = player_hsv_ema[play_id].get(track_id)
+    if ema is None:
+        player_hsv_ema[play_id][track_id] = hsv.copy()
+    else:
+        player_hsv_ema[play_id][track_id] = (1-EMA_ALPHA)*ema + EMA_ALPHA*hsv
+
+def vote_for_team(play_id, track_id, team):
+    """Count a vote and lock when we have enough evidence."""
+    votes = player_team_votes[play_id].setdefault(track_id, {"home":0, "away":0, "locked":False})
+    if votes["locked"]:
+        return
+    votes[team] += 1
+    total = votes["home"] + votes["away"]
+    if total >= 5:                              # need at least 5 votes
+        ratio = votes["home"] / total if team == "home" else votes["away"] / total
+        if max(votes["home"], votes["away"]) / total >= VOTE_THRESHOLD:
+            votes["locked"] = True
+            votes["final"] = "home" if votes["home"] > votes["away"] else "away"
 
 def find_closest_points(predicted: np.ndarray, detected: np.ndarray, max_dist: float = 150) -> tuple:
     if len(predicted) == 0 or len(detected) == 0:
@@ -211,8 +330,19 @@ def get_full_destination_map() -> np.ndarray:
     return np.array(points, dtype=np.float32).reshape(-1, 1, 2)
 
 
+def classify_with_centers(hsv, home_center, away_center):
+    """Distance-based classification against the two global HSV centres."""
+    if home_center is None or away_center is None:
+        return "unknown"
+    d_home = np.linalg.norm(hsv - home_center)
+    d_away = np.linalg.norm(hsv - away_center)
+    return "home" if d_home < d_away else "away"
+
+
 # ============================= VIDEO PROCESSING =============================
 def process_video(play_id: str, video_path: str):
+    global home_hsv_center, away_hsv_center
+    
     try:
         logger.info(f"Starting processing: {play_id}")
 
@@ -229,6 +359,66 @@ def process_video(play_id: str, video_path: str):
             logger.error(f"[{play_id}] FATAL: Failed to get destination map points.")
             return
 
+        # ============================= FIRST PASS: COLLECT HSV + BRIGHTNESS SAMPLES =============================
+        logger.info(f"[{play_id}] First pass – collecting jersey HSV …")
+        cap_temp = cv2.VideoCapture(video_path)
+        first_pass_hsv = defaultdict(list)          # track_id → list of HSV vectors
+        frame_count_temp = 0
+        first_pass_frames = min(60, int(cap_temp.get(cv2.CAP_PROP_FRAME_COUNT)))  # a few more frames
+
+        while frame_count_temp < first_pass_frames:
+            ret, frame = cap_temp.read()
+            if not ret:
+                break
+            detections = run_yolo_detector(frame)
+            for track_id, xyxy in detections["player_boxes"]:
+                hsv = get_jersey_hsv(frame, xyxy)
+                if np.any(hsv):
+                    first_pass_hsv[track_id].append(hsv)
+            frame_count_temp += 1
+        cap_temp.release()
+
+        # ============================= CLUSTER PLAYERS INTO TWO TEAMS (BRIGHTNESS-BASED) =============================
+        all_samples = []
+        track_ids   = []
+        for tid, samples in first_pass_hsv.items():
+            if len(samples) >= 3:                     # need a few observations
+                all_samples.extend(samples)
+                track_ids.extend([tid] * len(samples))
+
+        if len(all_samples) >= 10:                     # safety
+            all_samples = np.array(all_samples, dtype=np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+            _, labels, centers = cv2.kmeans(all_samples, 2, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+
+            # decide which cluster is HOME (darker jersey)
+            mean_v = [np.mean(c[2]) for c in centers]
+            home_idx = np.argmin(mean_v)
+            away_idx = 1 - home_idx
+
+            home_center = centers[home_idx]
+            away_center = centers[away_idx]
+
+            # build per-player team map from the clustering result
+            player_team_map = {}
+            label_array = labels.flatten()
+            ptr = 0
+            for tid, samples in first_pass_hsv.items():
+                if len(samples) < 3:
+                    continue
+                cluster_votes = label_array[ptr:ptr+len(samples)]
+                vote_home = np.sum(cluster_votes == home_idx)
+                vote_away = np.sum(cluster_votes == away_idx)
+                player_team_map[tid] = "home" if vote_home > vote_away else "away"
+                ptr += len(samples)
+        else:
+            logger.warning(f"[{play_id}] Not enough jersey samples for K-means – fallback to brightness")
+            home_center = away_center = None
+            player_team_map = {}
+
+            
+
+        # ============================= MAIN VIDEO PROCESSING LOOP =============================
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             logger.error(f"Cannot open video: {video_path}")
@@ -244,8 +434,6 @@ def process_video(play_id: str, video_path: str):
         frame_cache = {}
         player_tracks = defaultdict(lambda: {"positions": [], "times": [], "team": None, "hsv": None})
         prev_homography = H
-
-        # For player list in frame
         frame_players = {}
 
         while True:
@@ -291,21 +479,27 @@ def process_video(play_id: str, video_path: str):
                     proj = cv2.perspectiveTransform(hotspot, H)[0][0]
                     x, y = int(proj[0]), int(proj[1])
                     if 0 <= x < MAP_WIDTH_PX and 0 <= y < MAP_HEIGHT_PX:
-                        hsv = get_average_hsv(frame, xyxy)
                         track = player_tracks[track_id]
 
-                        if track["team"] is None and np.any(hsv):
-                            track["hsv"] = hsv
-                            global home_hsv_center, away_hsv_center
-                            if home_hsv_center is None:
-                                home_hsv_center = hsv
-                                track["team"] = "home"
-                            elif away_hsv_center is None:
-                                away_hsv_center = hsv
-                                track["team"] = "away"
+                        if track["team"] is None:
+                            # 1. try the first-pass map
+                            if track_id in player_team_map:
+                                track["team"] = player_team_map[track_id]
                             else:
-                                track["team"] = classify_player_team(hsv)
+                                # 2. fallback – classify on-the-fly and also update the EMA centers
+                                hsv = get_jersey_hsv(frame, xyxy)
+                                if np.any(hsv) and home_center is not None and away_center is not None:
+                                    track["team"] = classify_with_centers(hsv, home_center, away_center)
 
+                                    # keep EMA centers alive for the whole play
+                                    if track["team"] == "home":
+                                        home_center, _ = update_team_centers(home_center, away_center, [hsv], [], alpha=0.2)
+                                    else:
+                                        _, away_center = update_team_centers(home_center, away_center, [], [hsv], alpha=0.2)
+                                else:
+                                    track["team"] = "unknown"
+
+                        # colour choice stays the same
                         color = COLOR_HOME if track["team"] == "home" else COLOR_AWAY
                         cv2.circle(topdown, (x, y), 15, color, -1)
                         cv2.putText(topdown, str(track_id), (x - 12, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
@@ -313,10 +507,9 @@ def process_video(play_id: str, video_path: str):
                         track["positions"].append((x, y))
                         track["times"].append(cur_time)
 
-                        # Add to frame players list
                         current_frame_players.append({
                             "id": str(track_id),
-                            "number": str(track_id),  # fallback
+                            "number": str(track_id),
                             "team": track["team"] or "unknown",
                             "role": "Unknown",
                             "x": x,
